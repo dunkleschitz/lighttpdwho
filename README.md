@@ -279,10 +279,12 @@ exactly as the manual text is the only authority.
 - [x] Tests green (94/94)
 - [x] Dogfood: doccover + clicheck clean (Nov 9 campaign: clicheck 15/15, doccover 16/16, 0 gaps)
 - [x] Bench-audit map extended (Nov 9 campaign: added to audit.py TOOLS map; A1–A7 re-run via the audit's own functions, 7 checks, 0 findings; tests re-verified 94/94)
-- [ ] Local commit (separate campaign step)
-- [ ] README + CHANGELOG in place (LICENSE (MIT) + CI workflow are
-      prepublish-check items, separate campaign step)
-- [ ] Prepublish-check clean (separate campaign step)
+- [x] Local commit (Nov 9 campaign: fcb1b74)
+- [x] README + CHANGELOG in place; LICENSE (MIT) + CI workflow
+      added at prepublish-check (Nov 9 campaign)
+- [x] Prepublish-check clean (Nov 9 campaign: stdlib-only, no
+      secret-like literals, scoped run over lighttpdwho only;
+      tests re-verified 94/94)
 - [ ] Publish: **NOT covered by the Nov 9 campaign pre-approval**
       (that names only haproxywho/squidwho/keepalivedwho) — needs
       Sam's explicit per-project approval. Do NOT publish, set a
