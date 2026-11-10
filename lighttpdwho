@@ -1,0 +1,2284 @@
+#!/usr/bin/env python3
+"""lighttpdwho - which lighttpd condition block sets KEY for this request,
+and at which file:line?
+
+A static model of lighttpd's documented config-selection rules
+(DESIGN-lighttpdwho.md, BUILD APPROVED 2026-11-09). Semantics pinned to
+Docs_Configuration (lighttpd redmine, current), lighttpd(8), and the
+2022-12 maintainer note on include resolution. Claims are tagged
+[documented], [docs-inferred], or [hypothesized]; no lighttpd binary
+exists on this box, so no claim here is [observed] and there is no
+live-agreement test to skip-guard against: `lighttpd -p` prints a
+flattened, provenance-free parsed form whose production requires
+executing the config's own `include_shell` fragments, so it cannot
+serve as a safe oracle. Hermetic fixture trees are the only oracle,
+exactly as the manual text is the only authority.
+
+Pinned semantics (LT01-LT27 in the design doc):
+- LT01 per-key config selection, never request handling; a key with no
+  applicable assignment is NOT-SET, never a guessed default.
+- LT02 include chain: textual in-place insertion, in the enclosing
+  scope; missing literal include and include cycles are fatal (exit 2).
+- LT03 relative includes resolve against the MAIN config file's
+  directory, not the including file's.
+- LT04 include globs expand in byte-wise sorted order; a glob matching
+  nothing is a warning, and a NOT-SET answer over an empty glob lists
+  it as [possibly-missing].
+- LT05 include_shell is NEVER executed; it is inventoried verbatim and
+  poisons positionally (Kleene): absorbed by a later TRUE decider,
+  otherwise the verdict is UNKNOWN with the shell line as blocker.
+- LT06 global { } lifts assignments to root scope, at their stream
+  position among root assignments.
+- LT07 var./env. are parse-time and sequential; var.PID / var.CWD are
+  daemon-runtime facts rendered as <PID-unknown> / <CWD-unknown>;
+  env. comes only from --env, never from this process's environment.
+- LT08 assignment operators are scope-local: = assigns, += merges onto
+  the same scope's earlier value, := replaces.
+- LT09 last matching condition wins; NOTHING merges across scopes.
+  A conditional assignment replaces the root value whole.
+- LT10 conditional fields/operators/version gates; legacy header aliases
+  normalize to $REQUEST_HEADER[...] with a banner.
+- LT11 no AND/OR operators; a header with && / || is unparseable.
+- LT12 nesting is AND; the nested scope is later in precedence.
+- LT13 else/elif chains short-circuit; a branch matches iff all previous
+  branches are FALSE and its own test is TRUE; a previous UNKNOWN makes
+  later branches UNKNOWN; else attaches only to the immediately
+  preceding block in the same file.
+- LT14 identical conditions at one level are merged at parse time.
+- LT15 precedence: root is the base layer, then matching scopes in
+  depth-first document order; a root line after a conditional never
+  shadows it for a matching request.
+- LT16 $HTTP["host"] is the authority as given; ==/!=/=^/=$ are
+  case-insensitive, regexes run on the lowercased host; a host regex
+  anchored at the end without a port allowance raises the
+  [host-regex-port-trap] finding.
+- LT17 $HTTP["remoteip"] is the peer address; CIDR only for ==/!=.
+- LT18 url/querystring/scheme/method/headers; an absent header is the
+  empty string; only a query field the operator did not supply is
+  UNKNOWN -- nothing is ever defaulted.
+- LT19 regexes are PCRE; Python `re` is a subset, never an
+  approximation: unsupported constructs are [regex-unknown] (UNKNOWN),
+  invalid patterns poison their scope.
+- LT20 $SERVER["socket"] is evaluated against --socket as written, with
+  omitted-IP expansion; a socket scope with no --socket is UNKNOWN.
+- LT21 three-valued (Kleene) evaluation; the last TRUE-scope assignment
+  is the decider unless an UNKNOWN-scope assignment sits after it.
+- LT22 verdict vocabulary: EFFECTIVE (exit 0), NOT-SET (exit 1),
+  UNKNOWN (exit 1).
+- LT23 unparseable lines poison the selected answer positionally; one
+  broken vhost must not blind the tool to the other forty.
+- LT24 values are opaque, rendered as selected; %0-%9 / $0-$9 /
+  ${url.*} tokens are rendered verbatim, never evaluated.
+- LT25 runtime vhost modules (mod_simple_vhost, mod_evhost,
+  mod_vhostdb, mod_mysql_vhost, mod_magnet) make server.document-root
+  UNKNOWN; for other keys their presence is a banner only.
+- LT26 safety: pure text parsing; no subprocess, no network, no writes,
+  no environment reads. The only value printed is the queried key's.
+- LT27 coverage on every run: files read, includes, scopes, keys,
+  gated assignments, dependencies, unparseable lines.
+
+The tool never runs lighttpd, never executes anything in the config,
+and never reads the process environment.
+"""
+
+import argparse
+import bisect
+import glob
+import ipaddress
+import json
+import os
+import re
+import sys
+from collections import deque
+
+VERSION = "1.0.0"
+
+TRUE = "TRUE"
+FALSE = "FALSE"
+UNKNOWN = "UNKNOWN"
+
+RUNTIME_VHOST_MODULES = (
+    "mod_simple_vhost",
+    "mod_evhost",
+    "mod_vhostdb",
+    "mod_mysql_vhost",
+    "mod_magnet",
+)
+DEFAULT_CONF = "/etc/lighttpd/lighttpd.conf"
+
+KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_-]+)+$")
+
+
+# ---------------------------------------------------------------- values
+
+def escape_str(text):
+    return (text.replace("\\", "\\\\").replace('"', '\\"')
+                .replace("\n", "\\n").replace("\t", "\\t")
+                .replace("\r", "\\r"))
+
+
+class Value(object):
+    """A config value. `placeholders` holds the full placeholder tokens
+    (e.g. "<PID-unknown>") spliced into a string value."""
+
+    __slots__ = ("kind", "data", "placeholders")
+
+    def __init__(self, kind, data, placeholders=()):
+        self.kind = kind
+        self.data = data
+        self.placeholders = list(placeholders)
+
+    @property
+    def has_placeholder(self):
+        return bool(self.placeholders)
+
+    def as_text(self):
+        if self.kind == "str":
+            return self.data
+        if self.kind in ("int", "float"):
+            return str(self.data)
+        if self.kind == "bool":
+            return "enable" if self.data else "disable"
+        return self.render()
+
+    def render(self):
+        if self.kind == "str":
+            if (len(self.placeholders) == 1
+                    and self.data == self.placeholders[0]):
+                return self.data
+            return '"' + escape_str(self.data) + '"'
+        if self.kind in ("int", "float"):
+            return str(self.data)
+        if self.kind == "bool":
+            return "enable" if self.data else "disable"
+        if self.kind == "array":
+            if not self.data:
+                return "( )"
+            return "( " + ", ".join(v.render() for v in self.data) + " )"
+        if self.kind == "keylist":
+            if not self.data:
+                return "( )"
+            parts = ['"%s" => %s' % (escape_str(k), v.render())
+                     for k, v in self.data]
+            return "( " + ", ".join(parts) + " )"
+        return str(self.data)
+
+
+def concat_values(a, b):
+    if a.kind == "array" and b.kind == "array":
+        return Value("array", a.data + b.data,
+                     a.placeholders + b.placeholders)
+    if (a.kind in ("str", "int", "float", "bool")
+            and b.kind in ("str", "int", "float", "bool")):
+        return Value("str", a.as_text() + b.as_text(),
+                     a.placeholders + b.placeholders)
+    raise Unparseable("cannot concatenate %s with %s" % (a.kind, b.kind))
+
+
+def merge_values(existing, new, findings, file_, line_):
+    """The += fold (LT08): `existing` is the scope-local value so far,
+    or None when there is no earlier assignment in this scope."""
+    if existing is None:
+        return new
+    if existing.kind == "array" and new.kind == "array":
+        return Value("array", existing.data + new.data,
+                     existing.placeholders + new.placeholders)
+    if (existing.kind in ("str", "int", "float", "bool")
+            and new.kind in ("str", "int", "float", "bool")):
+        return Value("str", existing.as_text() + new.as_text(),
+                     existing.placeholders + new.placeholders)
+    if findings is not None:
+        findings.append(Finding(
+            "LT08",
+            "+= mixes %s with %s; replacing instead of appending"
+            % (existing.kind, new.kind), file_, line_))
+    return new
+
+
+# ---------------------------------------------------------------- findings
+
+class Finding(object):
+    __slots__ = ("tag", "message", "file", "line")
+
+    def __init__(self, tag, message, file_=None, line=None):
+        self.tag = tag
+        self.message = message
+        self.file = file_
+        self.line = line
+
+    def to_dict(self):
+        return {"tag": self.tag, "message": self.message,
+                "file": self.file, "line": self.line}
+
+    def render(self):
+        loc = "%s:%d: " % (self.file, self.line) if self.file else ""
+        return "[%s] %s%s" % (self.tag, loc, self.message)
+
+
+class Unparseable(Exception):
+    def __init__(self, message, token=None):
+        super(Unparseable, self).__init__(message)
+        self.message = message
+        self.token = token
+
+
+class FatalConfig(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- tokenizer
+
+TOKEN_RE = re.compile(r"""
+    (?P<comment>\#[^\n]*)
+  | (?P<ws>[ \t\r\n]+)
+  | (?P<field>\$[A-Za-z_]+\["(?:\\.|[^"\\])*"\])
+  | (?P<string>"(?:\\.|[^"\\])*")
+  | (?P<number>[0-9]+(?:\.[0-9]+)?)
+  | (?P<op>==|!=|=~|!~|=\^|=\$|=>|\+=|:=|=|\+)
+  | (?P<punct>[{}(),])
+  | (?P<ident>[A-Za-z_][A-Za-z0-9_.\-]*)
+  | (?P<bad>.)
+""", re.VERBOSE)
+
+
+class Tok(object):
+    __slots__ = ("kind", "text", "file", "line")
+
+    def __init__(self, kind, text, file_, line):
+        self.kind = kind
+        self.text = text
+        self.file = file_
+        self.line = line
+
+    def __repr__(self):
+        return "Tok(%s, %r, %s:%d)" % (self.kind, self.text,
+                                       self.file, self.line)
+
+
+def tokenize(text, path):
+    line_starts = [0]
+    for m in re.finditer("\n", text):
+        line_starts.append(m.start() + 1)
+    toks = []
+    for m in TOKEN_RE.finditer(text):
+        kind = m.lastgroup
+        if kind in ("ws", "comment"):
+            continue
+        line = bisect.bisect_right(line_starts, m.start())
+        toks.append(Tok(kind, m.group(), path, line))
+    return toks
+
+
+def decode_string(raw):
+    """Decode a double-quoted config string. Only the escapes lighttpd
+    documents are decoded; anything else is kept verbatim so regex
+    patterns (\\., \\$, \\d, ...) survive intact."""
+    body = raw[1:-1]
+    out = []
+    i = 0
+    simple = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            nxt = body[i + 1]
+            if nxt in simple:
+                out.append(simple[nxt])
+            else:
+                out.append(c)
+                out.append(nxt)
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+# ---------------------------------------------------------------- model
+
+class Condition(object):
+    """One condition test: FIELD OP VALUE, evaluated at parse time as
+    far as var./env. allow (LT07)."""
+
+    __slots__ = ("field", "subfield", "op", "value", "value_unknown",
+                 "regex_unknown", "file", "line", "alias_note")
+
+    def __init__(self, field, subfield, op, value, value_unknown,
+                 regex_unknown, file_, line, alias_note=None):
+        self.field = field
+        self.subfield = subfield
+        self.op = op
+        self.value = value
+        self.value_unknown = value_unknown
+        self.regex_unknown = regex_unknown
+        self.file = file_
+        self.line = line
+        self.alias_note = alias_note
+
+    def identity(self):
+        sub = self.subfield.lower() if self.field == "header" \
+            and self.subfield else self.subfield
+        return (self.field, sub, self.op, self.value)
+
+    def header_text(self):
+        if self.field == "header":
+            return '$REQUEST_HEADER["%s"] %s "%s"' % (
+                self.subfield, self.op, escape_str(self.value))
+        if self.field == "socket":
+            return '$SERVER["socket"] %s "%s"' % (
+                self.op, escape_str(self.value))
+        return '$HTTP["%s"] %s "%s"' % (
+            self.field, self.op, escape_str(self.value))
+
+
+class Scope(object):
+    __slots__ = ("kind", "parent", "children", "assignments", "test",
+                 "header_file", "header_line", "chain", "chain_index",
+                 "precedence", "merged_from", "poisoned_header",
+                 "chain_branches")
+
+    def __init__(self, kind, parent, header_file=None, header_line=None,
+                 test=None):
+        self.kind = kind  # "root" | "condition" | "branch"
+        self.parent = parent
+        self.children = []
+        self.assignments = []
+        self.test = test
+        self.header_file = header_file
+        self.header_line = header_line
+        self.chain = None       # branch scopes: shared list of the chain
+        self.chain_index = 0
+        self.precedence = 0
+        self.merged_from = []   # (file, line) of merged sibling headers
+        self.poisoned_header = False
+        self.chain_branches = []
+
+    def header_text(self):
+        if self.test is None:
+            return "else"
+        return self.test.header_text()
+
+    def chain_desc(self):
+        """Scope chain from the outermost condition to this scope."""
+        segs = []
+        s = self
+        while s is not None and s.kind != "root":
+            if s.kind == "branch":
+                hdr = s.header_text()
+                num = s.chain_index if s.chain_index > 0 else 1
+                segs.append("else-branch %d (%s) at %s:%d"
+                            % (num, hdr,
+                               s.header_file, s.header_line))
+            else:
+                segs.append("%s at %s:%d"
+                            % (s.header_text(), s.header_file,
+                               s.header_line))
+            s = s.parent
+        segs.reverse()
+        return segs
+
+
+class Assignment(object):
+    __slots__ = ("key", "op", "value", "file", "line", "scope",
+                 "stream_index")
+
+    def __init__(self, key, op, value, file_, line, scope, stream_index):
+        self.key = key
+        self.op = op
+        self.value = value
+        self.file = file_
+        self.line = line
+        self.scope = scope
+        self.stream_index = stream_index
+
+
+class Model(object):
+    def __init__(self):
+        self.root = Scope("root", None)
+        self.files_read = []       # {path, bytes, lines}
+        self.includes = []         # {file, line, pattern, resolved,
+                                   #  kind, matches}
+        self.include_shells = []   # {file, line, command, scope,
+                                   #  stream_index}
+        self.poison_events = []    # {kind, file, line, scope,
+                                   #  stream_index, reason}
+        self.unparseable = []      # {file, line, scope, text,
+                                   #  assignment_shaped}
+        self.findings = []
+        self.regex_unknown = []    # {file, line, pattern, field}
+        self.env_unknown_refs = []  # {file, line, name}
+        self.empty_globs = []      # {file, line, pattern}
+        self.dependencies = {"env": set(), "pid": False, "cwd": False}
+        self.global_blocks = 0
+
+
+# ---------------------------------------------------------------- regex (LT19)
+
+def _possessive_present(pattern):
+    """A `+` immediately following *, +, ? or } (outside a character
+    class, unescaped) is a PCRE possessive quantifier: no faithful
+    Python equivalent."""
+    in_class = False
+    i = 0
+    prev_quant = False
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            prev_quant = False
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            prev_quant = False
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            prev_quant = False
+            continue
+        if c in "*+?":
+            if c == "+" and prev_quant:
+                return True
+            prev_quant = True
+            i += 1
+            continue
+        if c == "}":
+            if i + 1 < len(pattern) and pattern[i + 1] == "+":
+                return True
+            prev_quant = False
+            i += 1
+            continue
+        prev_quant = False
+        i += 1
+    return False
+
+
+def is_regex_unknown(pattern):
+    """True when the PCRE pattern uses a construct with no faithful
+    Python `re` equivalent (LT19): never approximate, return UNKNOWN."""
+    in_class = False
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            n = pattern[i + 1]
+            if n in ("z", "K", "p", "P", "h", "H", "R", "X", "e", "Q",
+                     "k"):
+                return True
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            continue
+        if c == "(" and i + 1 < len(pattern) and pattern[i + 1] == "?":
+            if i + 2 < len(pattern):
+                n2 = pattern[i + 2]
+                if n2 == "<":      # (?<= (?<! (?<name>
+                    return True
+                if n2 == "(":      # (?( conditional
+                    return True
+                if n2 == "|":      # (?| branch reset
+                    return True
+                if n2 in "RUJDU&":  # (?R (?U (?J (?D (?&name)
+                    return True
+            i += 1
+            continue
+        i += 1
+    return _possessive_present(pattern)
+
+
+def regex_status(pattern):
+    """'ok' | 'unknown' (LT19 subset boundary) | 'invalid' (LT23)."""
+    if is_regex_unknown(pattern):
+        return "unknown"
+    try:
+        re.compile(pattern)
+    except re.error:
+        return "invalid"
+    return "ok"
+
+
+def _ends_with_unescaped_anchor(pattern):
+    """True when the pattern ends in an unescaped `$` anchor."""
+    if not pattern.endswith("$"):
+        return False
+    backslashes = 0
+    i = len(pattern) - 2
+    while i >= 0 and pattern[i] == "\\":
+        backslashes += 1
+        i -= 1
+    return backslashes % 2 == 0
+
+
+# ---------------------------------------------------------------- fields (LT10)
+
+def map_field(name, sub, tok):
+    """Map a $VAR["..."] token to (field, subfield, alias_note)."""
+    if name == "HTTP":
+        if sub in ("host", "url", "querystring", "scheme",
+                   "request-method", "remoteip"):
+            return (sub, None, None)
+        aliases = {"cookie": "Cookie", "useragent": "User-Agent",
+                   "language": "Accept-Language",
+                   "referer": "Referer"}
+        if sub in aliases:
+            return ("header", aliases[sub],
+                    'legacy $HTTP["%s"] normalized to '
+                    '$REQUEST_HEADER["%s"] (LT10)'
+                    % (sub, aliases[sub]))
+        raise Unparseable('unknown $HTTP field "%s"' % sub, tok)
+    if name == "SERVER":
+        if sub == "socket":
+            return ("socket", None, None)
+        raise Unparseable('unknown $SERVER field "%s"' % sub, tok)
+    if name == "REQUEST_HEADER":
+        return ("header", sub, None)
+    raise Unparseable("unknown condition variable $%s" % name, tok)
+
+
+FIELD_RE = re.compile(
+    r'^\$([A-Za-z_]+)\["((?:\\.|[^"\\])*)"\]$')
+
+# ---------------------------------------------------------------- parser
+
+COND_OPS = ("==", "!=", "=~", "!~", "=^", "=$")
+ASSIGN_OPS = ("=", "+=", ":=")
+
+
+class Frame(object):
+    __slots__ = ("path", "root", "tokens")
+
+    def __init__(self, path, root, tokens):
+        self.path = path
+        self.root = root
+        self.tokens = deque(tokens)
+
+
+class Parser(object):
+    def __init__(self, roots, env, cwd):
+        self.env = env
+        self.cwd = cwd
+        self.model = Model()
+        self.var_table = {}
+        self.option_values = {}
+        self.stream_index = 0
+        self.frames = []
+        self.frame_paths = set()
+        for root in reversed(roots):
+            self.push_file(root, root)
+
+    # ---- token supply: a stack of frames, one per file being read ----
+
+    def push_file(self, path, root):
+        apath = os.path.abspath(path)
+        if apath in self.frame_paths:
+            raise FatalConfig("include cycle involving %s" % apath)
+        try:
+            with open(apath, "rb") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            raise FatalConfig("cannot read %s: %s" % (apath, exc))
+        text = raw.decode("utf-8", errors="replace")
+        self.frames.append(Frame(apath, root, tokenize(text, apath)))
+        self.frame_paths.add(apath)
+        self.model.files_read.append(
+            {"path": apath, "bytes": len(raw),
+             "lines": text.count("\n") + (1 if text else 0)})
+
+    def _top_frame(self):
+        for frame in reversed(self.frames):
+            if frame.tokens:
+                return frame
+        return None
+
+    def peek(self):
+        # Never pops: a frame stays an include ancestor (LT02 cycle
+        # set) until the parser reads a token from a frame below it.
+        frame = self._top_frame()
+        return frame.tokens[0] if frame is not None else None
+
+    def next(self):
+        frame = self._top_frame()
+        if frame is None:
+            return None
+        tok = frame.tokens.popleft()
+        # Frames above the one just read are exhausted: they are no
+        # longer ancestors, so they leave the cycle set.
+        while self.frames and self.frames[-1] is not frame:
+            dead = self.frames.pop()
+            self.frame_paths.discard(dead.path)
+        return tok
+
+    # ---- entry ----
+
+    def parse(self):
+        self.parse_statements(self.model.root, False)
+        while True:
+            tok = self.peek()
+            if tok is None:
+                break
+            if tok.kind == "punct" and tok.text == "}":
+                self.model.findings.append(Finding(
+                    "LT23", "stray closing brace at top level",
+                    tok.file, tok.line))
+                self.next()
+                self.parse_statements(self.model.root, False)
+                continue
+            break
+        return self.model
+
+    def parse_statements(self, scope, global_mode):
+        while True:
+            tok = self.peek()
+            if tok is None:
+                return
+            if tok.kind == "punct" and tok.text == "}":
+                return
+            self.parse_statement(scope, global_mode)
+
+    # ---- statements ----
+
+    def parse_statement(self, scope, global_mode):
+        tok = self.peek()
+        if tok is None:
+            return
+        if tok.kind == "ident":
+            text = tok.text
+            if text == "include":
+                self.next()
+                self.parse_include(scope, tok)
+                return
+            if text == "include_shell":
+                self.next()
+                self.parse_include_shell(scope, tok)
+                return
+            if text == "global":
+                self.next()
+                brace = self.next()
+                if brace is None or brace.kind != "punct" \
+                        or brace.text != "{":
+                    self.model.findings.append(Finding(
+                        "LT23", "global without a { block",
+                        tok.file, tok.line))
+                    self.skip_garbage(tok)
+                    return
+                self.model.global_blocks += 1
+                self.parse_statements(scope, True)
+                close = self.next()
+                if close is None or close.text != "}":
+                    self.model.findings.append(Finding(
+                        "LT23", "unterminated global { } block",
+                        tok.file, tok.line))
+                return
+            if text in ("if", "else", "elif", "elsif", "elseif"):
+                if text == "if":
+                    self.parse_condition(scope, global_mode)
+                else:
+                    self.parse_orphan_else(scope, global_mode)
+                return
+            self.parse_assignment(scope, global_mode, tok)
+            return
+        if tok.kind == "field":
+            self.parse_condition(scope, global_mode)
+            return
+        self.next()
+        self.model.findings.append(Finding(
+            "LT23", "unparseable line starting with %r" % tok.text,
+            tok.file, tok.line))
+        self.model.unparseable.append(
+            {"file": tok.file, "line": tok.line, "scope": scope,
+             "text": tok.text, "assignment_shaped": False})
+        self.skip_garbage(tok)
+
+    def scan_for_brace_on_line(self, start_tok):
+        """Consume tokens up to the `{` that opens a block on the same
+        line as `start_tok` (a condition header is one logical line,
+        LT00). Returns (found, skipped_count)."""
+        skipped = 0
+        while True:
+            tok = self.peek()
+            if tok is None:
+                return (False, skipped)
+            if tok.line > start_tok.line:
+                return (False, skipped)
+            if tok.kind == "punct" and tok.text == "{":
+                self.next()
+                return (True, skipped)
+            skipped += 1
+            self.next()
+
+    def parse_poison_block(self, scope, header_tok):
+        """Parse a `{ ... }` block whose header was unparseable as an
+        UNKNOWN scope (LT23): its assignments may decide the key."""
+        poison = Scope("condition", scope, header_tok.file,
+                       header_tok.line, None)
+        poison.poisoned_header = True
+        scope.children.append(poison)
+        self.parse_statements(poison, False)
+        close = self.next()
+        if close is None or close.text != "}":
+            self.model.findings.append(Finding(
+                "LT23", "unterminated condition block",
+                header_tok.file, header_tok.line))
+
+    def skip_garbage(self, start_tok):
+        """Consume tokens of a broken statement: to end of line, longer
+        only while inside ( ... ) / { ... } depth."""
+        depth = 0
+        while True:
+            tok = self.peek()
+            if tok is None:
+                return
+            if depth == 0 and tok.line > start_tok.line:
+                return
+            if tok.kind == "punct" and tok.text in ("(", "{"):
+                depth += 1
+            elif tok.kind == "punct" and tok.text in (")", "}"):
+                if depth == 0:
+                    return
+                depth -= 1
+            self.next()
+
+    # ---- assignments and var. definitions (LT07/LT08) ----
+
+    def parse_assignment(self, scope, global_mode, name_tok):
+        self.next()  # consume the name
+        op_tok = self.next()
+        if op_tok is None or op_tok.kind != "op" \
+                or op_tok.text not in ASSIGN_OPS:
+            self.model.findings.append(Finding(
+                "LT23",
+                "unparseable line: %r is not followed by =, += or :="
+                % name_tok.text, name_tok.file, name_tok.line))
+            self.model.unparseable.append(
+                {"file": name_tok.file, "line": name_tok.line,
+                 "scope": scope, "text": name_tok.text,
+                 "assignment_shaped": False})
+            self.skip_garbage(name_tok)
+            return
+        key = name_tok.text
+        try:
+            value = self.parse_value_expr()
+        except Unparseable as exc:
+            self.model.findings.append(Finding(
+                "LT23", "unparseable value for %s: %s"
+                % (key, exc.message), name_tok.file, name_tok.line))
+            self.model.unparseable.append(
+                {"file": name_tok.file, "line": name_tok.line,
+                 "scope": scope, "text": key + " " + op_tok.text,
+                 "assignment_shaped": True})
+            self.record_poison_event(
+                "unparseable", name_tok.file, name_tok.line, scope,
+                "unparseable assignment to %s (LT23)" % key)
+            self.skip_garbage(name_tok)
+            return
+        self.stream_index += 1
+        for ph in sorted(set(value.placeholders)):
+            if ph.startswith("<env:"):
+                self.model.findings.append(Finding(
+                    "LT07",
+                    "value depends on env.%s, which was not supplied "
+                    "via --env; rendered as %s (decider-known, "
+                    "value-unknown)" % (ph[5:-9], ph),
+                    name_tok.file, name_tok.line))
+            elif ph == "<PID-unknown>":
+                self.model.findings.append(Finding(
+                    "LT07",
+                    "value depends on var.PID, the daemon's pid at "
+                    "startup, which this tool cannot know; rendered "
+                    "as <PID-unknown> (decider-known, value-unknown)",
+                    name_tok.file, name_tok.line))
+            elif ph == "<CWD-unknown>":
+                self.model.findings.append(Finding(
+                    "LT07",
+                    "value depends on var.CWD and no --cwd was given; "
+                    "rendered as <CWD-unknown>",
+                    name_tok.file, name_tok.line))
+        if key.startswith("var."):
+            varname = key[4:]
+            if op_tok.text in ("=", ":="):
+                self.var_table[varname] = value
+            else:
+                self.var_table[varname] = merge_values(
+                    self.var_table.get(varname), value,
+                    self.model.findings, name_tok.file, name_tok.line)
+            return
+        target = self.model.root if global_mode else scope
+        target.assignments.append(Assignment(
+            key, op_tok.text, value, name_tok.file, name_tok.line,
+            target, self.stream_index))
+        self.option_values[key] = merge_values(
+            self.option_values.get(key), value, None,
+            name_tok.file, name_tok.line) \
+            if op_tok.text == "+=" else value
+
+    def record_poison_event(self, kind, file_, line, scope, reason):
+        self.stream_index += 1
+        self.model.poison_events.append(
+            {"kind": kind, "file": file_, "line": line, "scope": scope,
+             "stream_index": self.stream_index, "reason": reason})
+
+    # ---- values (LT00/LT07) ----
+
+    def parse_value_expr(self):
+        val = self.parse_value_primary()
+        while True:
+            tok = self.peek()
+            if tok is not None and tok.kind == "op" and tok.text == "+":
+                self.next()
+                rhs = self.parse_value_primary()
+                val = concat_values(val, rhs)
+            else:
+                return val
+
+    def parse_value_primary(self):
+        tok = self.next()
+        if tok is None:
+            raise Unparseable("unexpected end of config in value")
+        if tok.kind == "string":
+            return Value("str", decode_string(tok.text))
+        if tok.kind == "number":
+            if "." in tok.text:
+                return Value("float", float(tok.text))
+            return Value("int", int(tok.text))
+        if tok.kind == "punct" and tok.text == "(":
+            return self.parse_array(tok)
+        if tok.kind == "ident":
+            text = tok.text
+            if text == "enable":
+                return Value("bool", True)
+            if text == "disable":
+                return Value("bool", False)
+            if text.startswith("var."):
+                return self.var_value(text[4:], tok)
+            if text.startswith("env."):
+                return self.env_value(text[4:], tok)
+            if "." in text:
+                if text in self.option_values:
+                    return self.option_values[text]
+                raise Unparseable(
+                    "option reference %s has no value assigned so far"
+                    % text, tok)
+            return self.var_value(text, tok)
+        raise Unparseable("unexpected %s in value" % tok.text, tok)
+
+    def parse_array(self, open_tok):
+        entries = []
+        while True:
+            tok = self.peek()
+            if tok is None:
+                raise Unparseable("unterminated ( ... )", open_tok)
+            if tok.kind == "punct" and tok.text == ")":
+                self.next()
+                break
+            if tok.kind == "punct" and tok.text == ",":
+                self.next()
+                continue
+            first = self.parse_value_expr()
+            nxt = self.peek()
+            if nxt is not None and nxt.kind == "op" \
+                    and nxt.text == "=>":
+                self.next()
+                if first.kind != "str":
+                    raise Unparseable(
+                        "key-list key must be a string", nxt)
+                val = self.parse_value_expr()
+                entries.append((first.data, val))
+            else:
+                entries.append((None, first))
+        placeholders = []
+        for _k, v in entries:
+            placeholders.extend(v.placeholders)
+        if any(k is not None for k, _v in entries):
+            if any(k is None for k, _v in entries):
+                raise Unparseable(
+                    "mixed key-list and plain values in ( ... )",
+                    open_tok)
+            return Value("keylist", [(k, v) for k, v in entries],
+                         placeholders)
+        return Value("array", [v for _k, v in entries], placeholders)
+
+    def var_value(self, name, tok):
+        if name == "PID":
+            self.model.dependencies["pid"] = True
+            return Value("str", "<PID-unknown>", ["<PID-unknown>"])
+        if name == "CWD":
+            self.model.dependencies["cwd"] = True
+            if self.cwd is not None:
+                return Value("str", self.cwd)
+            return Value("str", "<CWD-unknown>", ["<CWD-unknown>"])
+        if name in self.var_table:
+            return self.var_table[name]
+        raise Unparseable("use of undefined var.%s" % name, tok)
+
+    def env_value(self, name, tok):
+        self.model.dependencies["env"].add(name)
+        if name in self.env:
+            return Value("str", self.env[name])
+        self.model.env_unknown_refs.append(
+            {"file": tok.file, "line": tok.line, "name": name})
+        return Value("str", "<env:%s-unknown>" % name,
+                     ["<env:%s-unknown>" % name])
+
+    # ---- include / include_shell (LT02/LT03/LT04/LT05) ----
+
+    def parse_include(self, scope, directive_tok):
+        frame = self.frames[-1]
+        try:
+            value = self.parse_value_expr()
+        except Unparseable as exc:
+            self.model.findings.append(Finding(
+                "LT23", "unparseable include path: %s" % exc.message,
+                directive_tok.file, directive_tok.line))
+            self.record_poison_event(
+                "include", directive_tok.file, directive_tok.line,
+                scope, "include path could not be evaluated (LT23)")
+            self.skip_garbage(directive_tok)
+            return
+        if value.kind != "str":
+            self.model.findings.append(Finding(
+                "LT23", "include path must be a string",
+                directive_tok.file, directive_tok.line))
+            self.record_poison_event(
+                "include", directive_tok.file, directive_tok.line,
+                scope, "include path is not a string (LT23)")
+            return
+        if value.has_placeholder:
+            self.model.findings.append(Finding(
+                "LT07",
+                "include path depends on an unknown value (%s); "
+                "the include was not followed"
+                % ", ".join(value.placeholders),
+                directive_tok.file, directive_tok.line))
+            self.record_poison_event(
+                "include", directive_tok.file, directive_tok.line,
+                scope,
+                "include path depends on an unknown value; "
+                "the unfollowed file could hold the decider (LT07)")
+            return
+        pattern = value.data
+        root_dir = os.path.dirname(frame.root)
+        if os.path.isabs(pattern):
+            resolved_pattern = pattern
+        else:
+            resolved_pattern = os.path.join(root_dir, pattern)
+            if os.path.dirname(frame.path) != root_dir:
+                self.model.findings.append(Finding(
+                    "LT03",
+                    'relative include "%s" resolves against the main '
+                    "config directory %s, not the including file's "
+                    "directory %s"
+                    % (pattern, root_dir, os.path.dirname(frame.path)),
+                    directive_tok.file, directive_tok.line))
+        if any(c in pattern for c in "*?["):
+            if any(c in pattern for c in "?["):
+                self.model.findings.append(Finding(
+                    "LT04",
+                    'include glob "%s" uses ?/[...] ; expanded with '
+                    "Python glob, the daemon's C glob may differ"
+                    % pattern, directive_tok.file, directive_tok.line))
+            matches = sorted(glob.glob(resolved_pattern))
+            files = [m for m in matches if os.path.isfile(m)]
+            for m in matches:
+                if not os.path.isfile(m):
+                    self.model.findings.append(Finding(
+                        "LT04", "glob match %s is not a file; skipped"
+                        % m, directive_tok.file, directive_tok.line))
+            self.model.includes.append(
+                {"file": directive_tok.file, "line": directive_tok.line,
+                 "pattern": pattern, "resolved": resolved_pattern,
+                 "kind": "glob-empty" if not files else "glob",
+                 "matches": files})
+            if not files:
+                self.model.findings.append(Finding(
+                    "LT04", 'include glob "%s" matched nothing'
+                    % pattern, directive_tok.file, directive_tok.line))
+                self.model.empty_globs.append(
+                    {"file": directive_tok.file,
+                     "line": directive_tok.line, "pattern": pattern})
+            for m in reversed(files):
+                self.push_file(m, frame.root)
+            return
+        self.model.includes.append(
+            {"file": directive_tok.file, "line": directive_tok.line,
+             "pattern": pattern, "resolved": resolved_pattern,
+             "kind": "literal", "matches": [resolved_pattern]})
+        if not os.path.isfile(resolved_pattern):
+            raise FatalConfig(
+                "include %s not found (resolved to %s)"
+                % (pattern, resolved_pattern))
+        self.push_file(resolved_pattern, frame.root)
+
+    def parse_include_shell(self, scope, directive_tok):
+        try:
+            value = self.parse_value_expr()
+        except Unparseable as exc:
+            self.model.findings.append(Finding(
+                "LT23",
+                "unparseable include_shell command: %s" % exc.message,
+                directive_tok.file, directive_tok.line))
+            self.record_poison_event(
+                "include_shell", directive_tok.file, directive_tok.line,
+                scope, "include_shell command could not be read (LT23)")
+            self.skip_garbage(directive_tok)
+            return
+        if value.kind != "str":
+            self.model.findings.append(Finding(
+                "LT23", "include_shell command must be a string",
+                directive_tok.file, directive_tok.line))
+            self.record_poison_event(
+                "include_shell", directive_tok.file, directive_tok.line,
+                scope, "include_shell command is not a string (LT23)")
+            return
+        command = value.data
+        self.stream_index += 1
+        self.model.include_shells.append(
+            {"file": directive_tok.file, "line": directive_tok.line,
+             "command": command, "scope": scope,
+             "stream_index": self.stream_index})
+        self.model.poison_events.append(
+            {"kind": "include_shell", "file": directive_tok.file,
+             "line": directive_tok.line, "scope": scope,
+             "stream_index": self.stream_index,
+             "reason": 'include_shell "%s" was not executed; its '
+                       "output could set this key (LT05)" % command})
+
+    # ---- conditions (LT10-LT14) ----
+
+    def build_condition(self, field_tok, op_tok, value):
+        m = FIELD_RE.match(field_tok.text)
+        if not m:
+            raise Unparseable(
+                "malformed condition variable %r" % field_tok.text,
+                field_tok)
+        field, subfield, alias_note = map_field(
+            m.group(1), decode_string('"' + m.group(2) + '"'), field_tok)
+        if value.kind in ("array", "keylist"):
+            raise Unparseable(
+                "condition value must be a string, got %s" % value.kind,
+                field_tok)
+        cond = Condition(field, subfield, op_tok.text, value.as_text(),
+                         value.has_placeholder, False,
+                         field_tok.file, field_tok.line, alias_note)
+        if value.has_placeholder:
+            self.model.findings.append(Finding(
+                "LT07",
+                "condition value depends on %s, which this tool "
+                "cannot know; the test is UNKNOWN"
+                % ", ".join(sorted(set(value.placeholders))),
+                field_tok.file, field_tok.line))
+        if alias_note:
+            self.model.findings.append(Finding(
+                "LT10", alias_note, field_tok.file, field_tok.line))
+        if op_tok.text in ("=~", "!~"):
+            status = regex_status(cond.value)
+            if status == "unknown":
+                cond.regex_unknown = True
+                self.model.regex_unknown.append(
+                    {"file": field_tok.file, "line": field_tok.line,
+                     "pattern": cond.value, "field": field})
+            elif status == "invalid":
+                raise Unparseable(
+                    "invalid regex %r" % cond.value, field_tok)
+            if field == "host" \
+                    and _ends_with_unescaped_anchor(cond.value) \
+                    and ":" not in cond.value:
+                self.model.findings.append(Finding(
+                    "LT16",
+                    "host regex %r is anchored at the end with no "
+                    "port allowance: it stops matching on any "
+                    "non-default port ([host-regex-port-trap])"
+                    % cond.value, field_tok.file, field_tok.line))
+        if field == "remoteip" and op_tok.text in ("==", "!=") \
+                and "/" in cond.value:
+            try:
+                ipaddress.ip_network(cond.value, strict=False)
+            except ValueError:
+                raise Unparseable(
+                    "malformed CIDR %r" % cond.value, field_tok)
+        return cond
+
+    def find_identical_sibling(self, parent_scope, cond, standalone):
+        """LT14: returns ("merge", scope) | ("conflict", scope) |
+        (None, None)."""
+        for child in parent_scope.children:
+            if child.kind not in ("condition", "branch"):
+                continue
+            if child.test is None:
+                continue
+            if child.test.identity() == cond.identity():
+                if standalone and child.kind == "condition":
+                    return ("merge", child)
+                return ("conflict", child)
+        return (None, None)
+
+    def parse_condition(self, scope, global_mode):
+        start_tok = self.peek()
+        if start_tok is not None and start_tok.kind == "ident" \
+                and start_tok.text == "if":
+            self.next()
+        field_tok = self.next()
+        if field_tok is None or field_tok.kind != "field":
+            bad = field_tok.text if field_tok else "end of config"
+            self.model.findings.append(Finding(
+                "LT23", "condition header does not start with a "
+                        "$HTTP/$SERVER/$REQUEST_HEADER field (got %r)"
+                        % bad,
+                field_tok.file if field_tok else None,
+                field_tok.line if field_tok else None))
+            self.skip_garbage(start_tok)
+            return
+        op_tok = self.next()
+        if op_tok is None or op_tok.kind != "op" \
+                or op_tok.text not in COND_OPS:
+            self.model.findings.append(Finding(
+                "LT23",
+                "condition header has no valid operator after %s"
+                % field_tok.text, field_tok.file, field_tok.line))
+            if self.scan_for_brace_on_line(field_tok)[0]:
+                self.parse_poison_block(scope, field_tok)
+            return
+        cond = None
+        header_ok = True
+        brace_found = False
+        try:
+            value = self.parse_value_expr()
+            cond = self.build_condition(field_tok, op_tok, value)
+        except Unparseable as exc:
+            header_ok = False
+            self.model.findings.append(Finding(
+                "LT23", "unparseable condition header: %s" % exc.message,
+                field_tok.file, field_tok.line))
+            if exc.token is not None and exc.token.kind == "punct" \
+                    and exc.token.text == "{":
+                brace_found = True
+        if not brace_found:
+            found, skipped = self.scan_for_brace_on_line(field_tok)
+            if not found:
+                if header_ok:
+                    self.model.findings.append(Finding(
+                        "LT23",
+                        "condition header without a { block",
+                        field_tok.file, field_tok.line))
+                return
+            if skipped:
+                # Trailing garbage between the value and the block
+                # opener (e.g. `|| ...`): the header is unparseable
+                # and the block belongs to it as a poison scope, not
+                # to a fresh standalone condition (LT11/LT23).
+                header_ok = False
+                cond = None
+                self.model.findings.append(Finding(
+                    "LT23",
+                    "unexpected tokens between condition value and "
+                    "{; the header is unparseable",
+                    field_tok.file, field_tok.line))
+        new_scope = Scope("condition", scope, field_tok.file,
+                          field_tok.line, cond)
+        if not header_ok or cond is None:
+            new_scope.poisoned_header = True
+        target_scope = new_scope
+        if cond is not None and not new_scope.poisoned_header:
+            status, other = self.find_identical_sibling(
+                scope, cond, standalone=True)
+            if status == "merge":
+                other.merged_from.append(
+                    (field_tok.file, field_tok.line))
+                self.model.findings.append(Finding(
+                    "LT14",
+                    "identical condition block merged with the block "
+                    "at %s:%d; assignments from both are considered "
+                    "in document order"
+                    % (other.header_file, other.header_line),
+                    field_tok.file, field_tok.line))
+                target_scope = other
+            elif status == "conflict":
+                self.model.findings.append(Finding(
+                    "LT14",
+                    "condition repeats an identical block at %s:%d "
+                    "([condition-merge-conflict]); the daemon may "
+                    "refuse this config"
+                    % (other.header_file, other.header_line),
+                    field_tok.file, field_tok.line))
+                scope.children.append(new_scope)
+            else:
+                scope.children.append(new_scope)
+        else:
+            scope.children.append(new_scope)
+        if scope is not None and scope.kind == "condition" \
+                and cond is not None and cond.field == "socket":
+            self.model.findings.append(Finding(
+                "LT20",
+                '$SERVER["socket"] nested inside another condition; '
+                "the docs note this may have undesirable results",
+                field_tok.file, field_tok.line))
+        self.parse_statements(target_scope, False)
+        close = self.next()
+        close_file = close.file if close is not None else field_tok.file
+        if close is None or close.text != "}":
+            self.model.findings.append(Finding(
+                "LT23", "unterminated condition block",
+                field_tok.file, field_tok.line))
+            return
+        self.parse_else_chain(scope, target_scope, close_file)
+
+    def parse_else_chain(self, parent_scope, head_scope, close_file):
+        # The evaluation chain is [head, branch1, branch2, ...]: the
+        # head condition occupies position 0 so else branches see its
+        # test as the previous branch (LT13). branch.chain_index is
+        # therefore 1-based among branches.
+        branches = head_scope.chain_branches
+        if not branches:
+            branches.append(head_scope)
+            head_scope.chain_branches = branches
+        while True:
+            tok = self.peek()
+            if tok is None or tok.kind != "ident" \
+                    or tok.text not in ("else", "elif", "elsif",
+                                        "elseif"):
+                return
+            if tok.file != close_file:
+                # LT13 open question: v1 does not attach an else
+                # across an include boundary; the statement loop will
+                # treat it as an orphan else.
+                return
+            self.next()
+            nxt = self.peek()
+            if nxt is not None and nxt.kind == "ident" \
+                    and nxt.text in ("if", "elif", "elsif", "elseif"):
+                self.next()
+            branch = Scope("branch", parent_scope, tok.file, tok.line,
+                           None)
+            branch.chain = branches
+            branch.chain_index = len(branches)
+            nxt = self.peek()
+            if nxt is not None and nxt.kind == "punct" \
+                    and nxt.text == "{":
+                self.next()  # bare else
+            else:
+                field_tok = self.next()
+                if field_tok is None or field_tok.kind != "field":
+                    self.model.findings.append(Finding(
+                        "LT23",
+                        "else branch without a condition field",
+                        tok.file, tok.line))
+                    self.skip_garbage(tok)
+                    return
+                op_tok = self.next()
+                if op_tok is None or op_tok.kind != "op" \
+                        or op_tok.text not in COND_OPS:
+                    self.model.findings.append(Finding(
+                        "LT23",
+                        "else branch without a valid operator",
+                        tok.file, tok.line))
+                    self.skip_garbage(tok)
+                    return
+                brace_consumed = False
+                try:
+                    value = self.parse_value_expr()
+                    branch.test = self.build_condition(
+                        field_tok, op_tok, value)
+                except Unparseable as exc:
+                    branch.poisoned_header = True
+                    self.model.findings.append(Finding(
+                        "LT23",
+                        "unparseable else-branch header: %s"
+                        % exc.message, field_tok.file, field_tok.line))
+                    if exc.token is not None \
+                            and exc.token.kind == "punct" \
+                            and exc.token.text == "{":
+                        brace_consumed = True
+                if not brace_consumed:
+                    brace = self.next()
+                    if brace is None or brace.kind != "punct" \
+                            or brace.text != "{":
+                        self.model.findings.append(Finding(
+                            "LT23", "else branch without a { block",
+                            tok.file, tok.line))
+                        return
+            if branch.test is not None:
+                status, other = self.find_identical_sibling(
+                    parent_scope, branch.test, standalone=False)
+                if status == "conflict":
+                    self.model.findings.append(Finding(
+                        "LT14",
+                        "else-branch condition repeats an identical "
+                        "block at %s:%d "
+                        "([condition-merge-conflict]); the daemon may "
+                        "refuse this config"
+                        % (other.header_file, other.header_line),
+                        tok.file, tok.line))
+            parent_scope.children.append(branch)
+            branches.append(branch)
+            self.parse_statements(branch, False)
+            close = self.next()
+            if close is None or close.text != "}":
+                self.model.findings.append(Finding(
+                    "LT23", "unterminated else branch",
+                    tok.file, tok.line))
+                return
+            close_file = close.file if close is not None else tok.file
+
+    def parse_orphan_else(self, scope, global_mode):
+        else_tok = self.next()
+        self.model.findings.append(Finding(
+            "LT13",
+            "orphan else with no preceding condition block at this "
+            "level; treated as an UNKNOWN scope, never as a "
+            "standalone negation", else_tok.file, else_tok.line))
+        nxt = self.peek()
+        if nxt is not None and nxt.kind == "ident" \
+                and nxt.text == "if":
+            self.next()
+        nxt = self.peek()
+        poison = Scope("branch", scope, else_tok.file, else_tok.line,
+                       None)
+        poison.poisoned_header = True
+        if nxt is not None and nxt.kind == "punct" \
+                and nxt.text == "{":
+            self.next()
+            scope.children.append(poison)
+            self.parse_statements(poison, False)
+            close = self.next()
+            if close is None or close.text != "}":
+                self.model.findings.append(Finding(
+                    "LT23", "unterminated orphan else block",
+                    else_tok.file, else_tok.line))
+            return
+        try:
+            field_tok = self.next()
+            op_tok = self.next()
+            value = self.parse_value_expr()
+            poison.test = self.build_condition(field_tok, op_tok, value)
+        except Unparseable:
+            poison.test = None
+        brace = self.peek()
+        if brace is None or brace.kind != "punct" \
+                or brace.text != "{":
+            self.skip_garbage(else_tok)
+            return
+        self.next()
+        scope.children.append(poison)
+        self.parse_statements(poison, False)
+        close = self.next()
+        if close is None or close.text != "}":
+            self.model.findings.append(Finding(
+                "LT23", "unterminated orphan else block",
+                else_tok.file, else_tok.line))
+
+# ---------------------------------------------------------------- evaluation
+
+class Request(object):
+    def __init__(self, args):
+        self.host = args.host
+        self.url = args.url
+        self.querystring = args.querystring
+        self.scheme = args.scheme
+        self.method = args.method
+        self.remoteip = args.remoteip
+        self.socket = args.socket
+        self.headers = {}
+        self.header_dup = False
+        for h in args.header or []:
+            name, _sep, val = h.partition(":")
+            lname = name.strip().lower()
+            if lname in self.headers:
+                self.header_dup = True
+            self.headers[lname] = val.strip()
+
+
+def kleene_and(a, b):
+    if a == FALSE or b == FALSE:
+        return FALSE
+    if a == UNKNOWN or b == UNKNOWN:
+        return UNKNOWN
+    return TRUE
+
+
+def expand_socket(value):
+    """A socket value with an omitted IP means INADDR_ANY (LT20)."""
+    if value.startswith(":"):
+        return "0.0.0.0" + value
+    return value
+
+
+def field_value(cond, req):
+    f = cond.field
+    if f == "host":
+        return req.host
+    if f == "url":
+        return req.url
+    if f == "querystring":
+        return req.querystring
+    if f == "scheme":
+        return req.scheme
+    if f == "request-method":
+        return req.method
+    if f == "remoteip":
+        return req.remoteip
+    if f == "socket":
+        return req.socket
+    if f == "header":
+        return req.headers.get(cond.subfield.lower(), "")
+    return None
+
+
+def test_verdict(cond, req):
+    if cond.value_unknown:
+        return UNKNOWN
+    if cond.op in ("=~", "!~") and cond.regex_unknown:
+        return UNKNOWN
+    fval = field_value(cond, req)
+    if fval is None:
+        return UNKNOWN
+    op = cond.op
+    cval = cond.value
+    if cond.field == "remoteip" and op in ("==", "!=") \
+            and "/" in cval:
+        try:
+            net = ipaddress.ip_network(cval, strict=False)
+            addr = ipaddress.ip_address(fval)
+        except ValueError:
+            return UNKNOWN
+        try:
+            inside = addr in net
+        except TypeError:
+            inside = False
+        return TRUE if (inside == (op == "==")) else FALSE
+    if cond.field == "socket":
+        fval = expand_socket(fval)
+        cval = expand_socket(cval)
+    if cond.field == "host":
+        fval_cmp = fval.lower()
+        cval_cmp = cval.lower()
+    else:
+        fval_cmp, cval_cmp = fval, cval
+    if op == "==":
+        return TRUE if fval_cmp == cval_cmp else FALSE
+    if op == "!=":
+        return TRUE if fval_cmp != cval_cmp else FALSE
+    if op == "=^":
+        return TRUE if fval_cmp.startswith(cval_cmp) else FALSE
+    if op == "=$":
+        return TRUE if fval_cmp.endswith(cval_cmp) else FALSE
+    if op in ("=~", "!~"):
+        try:
+            matched = re.search(
+                cval, fval_cmp if cond.field == "host" else fval) \
+                is not None
+        except re.error:
+            return UNKNOWN
+        if op == "=~":
+            return TRUE if matched else FALSE
+        return TRUE if not matched else FALSE
+    return UNKNOWN
+
+
+def branch_raw(branch, req):
+    """The chain-position match of an else/elif branch (LT13): it
+    matches iff no previous branch matched and its own test is TRUE;
+    a previous UNKNOWN makes it UNKNOWN; a previous match makes it
+    FALSE (short-circuit, #2598)."""
+    chain = branch.chain or []
+    idx = branch.chain_index
+    prev = []
+    for j in range(idx):
+        other = chain[j]
+        if other.test is None:
+            prev.append(TRUE)
+        else:
+            prev.append(test_verdict(other.test, req))
+    for j, t in enumerate(prev):
+        if all(p == FALSE for p in prev[:j]):
+            if t == TRUE:
+                return FALSE
+            if t == UNKNOWN:
+                return UNKNOWN
+    if branch.test is None:
+        return TRUE
+    return test_verdict(branch.test, req)
+
+
+def scope_verdict(scope, req, cache):
+    if scope in cache:
+        return cache[scope]
+    if scope.kind == "root":
+        v = TRUE
+    else:
+        parent_v = scope_verdict(scope.parent, req, cache)
+        if scope.poisoned_header:
+            own = UNKNOWN
+        elif scope.kind == "branch":
+            own = branch_raw(scope, req)
+        else:
+            own = test_verdict(scope.test, req)
+        v = kleene_and(parent_v, own)
+    cache[scope] = v
+    return v
+
+
+def assign_precedence(model):
+    counter = [1]
+
+    def walk(scope):
+        for child in scope.children:
+            child.precedence = counter[0]
+            counter[0] += 1
+            walk(child)
+
+    model.root.precedence = 0
+    walk(model.root)
+
+
+def fold_scope_assignments(assignments, findings):
+    """Fold one scope's assignments to one key in order (LT08).
+    Returns (folded Value, last assignment, shadowed assignments)."""
+    cur = None
+    last = None
+    shadowed = []
+    for a in assignments:
+        if a.op in ("=", ":="):
+            for later in assignments[assignments.index(a) + 1:]:
+                if later.op in ("=", ":="):
+                    shadowed.append(a)
+                    break
+        if a.op in ("=", ":="):
+            cur = a.value
+        else:
+            cur = merge_values(cur, a.value, findings, a.file, a.line)
+        last = a
+    return cur, last, shadowed
+
+
+def module_names(value):
+    if value is None:
+        return []
+    if value.kind == "array":
+        return [v.as_text() for v in value.data if v.kind == "str"]
+    if value.kind == "str":
+        return [value.data]
+    return []
+
+
+def effective_modules(model, req):
+    """The effective server.modules for this request (LT25): the real
+    selection when it is EFFECTIVE, else root-scope assignments,
+    bannered as approximate. Returns (names, decider assignment or
+    None, approximate bool)."""
+    sub = select(model, "server.modules", req, findings_sink=[])
+    if sub["verdict"] == "EFFECTIVE" and sub["value_obj"] is not None:
+        return module_names(sub["value_obj"]), sub["decider_assignment"], \
+            False
+    names = []
+    src = None
+    for a in model.root.assignments:
+        if a.key == "server.modules":
+            names.extend(module_names(a.value))
+            src = a
+    return names, src, True
+
+
+# ---------------------------------------------------------------- selection
+
+def select(model, key, req, findings_sink=None):
+    """The LT15/LT21 walk for one key. Returns a result dict; findings
+    generated here go to `findings_sink` (or a throwaway list)."""
+    if findings_sink is None:
+        findings_sink = []
+    cache = {}
+    candidates = []
+
+    def walk(scope):
+        for a in scope.assignments:
+            if a.key == key:
+                candidates.append((scope, a))
+        for child in scope.children:
+            walk(child)
+
+    walk(model.root)
+    candidates.sort(key=lambda sa: (sa[0].precedence,
+                                    sa[1].stream_index))
+    verdicts = {}
+    for scope, _a in candidates:
+        verdicts[scope] = scope_verdict(scope, req, cache)
+
+    def pos(scope, a):
+        return (scope.precedence, a.stream_index)
+
+    # Per-scope folds (LT08) and shadowed-duplicate findings.
+    scope_fold = {}
+    for scope, _a in candidates:
+        if scope in scope_fold:
+            continue
+        same = [a for s, a in candidates if s is scope]
+        folded, last, shadowed = fold_scope_assignments(same,
+                                                        findings_sink)
+        scope_fold[scope] = (folded, last)
+        for sh in shadowed:
+            findings_sink.append(Finding(
+                "LT08",
+                "duplicate %s for %s at %s:%d is shadowed by the "
+                "later %s at %s:%d in the same scope"
+                % (sh.op, key, sh.file, sh.line, last.op, last.file,
+                   last.line),
+                sh.file, sh.line))
+
+    true_cands = [(s, a) for s, a in candidates
+                  if verdicts[s] == TRUE]
+    decider = true_cands[-1] if true_cands else None
+    decider_pos = pos(decider[0], decider[1]) if decider else None
+
+    # Blockers: UNKNOWN-scope assignments after the decider (LT21),
+    # and poison events not absorbed by a later TRUE decider (LT05 /
+    # LT07 / LT23). The latest-positioned blocker is cited.
+    blockers = []
+
+    def consider_blocker(position, blocker):
+        blockers.append((position, blocker))
+
+    unknown_after = [(s, a) for s, a in candidates
+                     if verdicts[s] == UNKNOWN
+                     and (decider_pos is None
+                          or pos(s, a) > decider_pos)]
+    for s, a in unknown_after:
+        consider_blocker(pos(s, a), {
+            "file": a.file, "line": a.line, "kind": "unknown-scope",
+            "reason": "assignment in an UNKNOWN scope could be the "
+                      "decider (LT21)"})
+    unknown_before = [(s, a) for s, a in candidates
+                      if verdicts[s] == UNKNOWN
+                      and decider_pos is not None
+                      and pos(s, a) < decider_pos]
+    for s, a in unknown_before:
+        findings_sink.append(Finding(
+            "LT21",
+            "UNKNOWN-scope assignment to %s at %s:%d is absorbed by "
+            "the later decider at %s:%d"
+            % (key, a.file, a.line, decider[1].file, decider[1].line),
+            a.file, a.line))
+    for ev in model.poison_events:
+        ev_verdict = scope_verdict(ev["scope"], req, cache)
+        if ev_verdict == FALSE:
+            continue
+        ev_pos = (ev["scope"].precedence, ev["stream_index"])
+        if decider_pos is not None and decider_pos > ev_pos:
+            findings_sink.append(Finding(
+                "LT05" if ev["kind"] == "include_shell" else "LT23",
+                "%s at %s:%d is absorbed by the later decider at "
+                "%s:%d" % (ev["reason"].split(" (LT")[0],
+                           ev["file"], ev["line"],
+                           decider[1].file, decider[1].line),
+                ev["file"], ev["line"]))
+            continue
+        consider_blocker(ev_pos, {
+            "file": ev["file"], "line": ev["line"],
+            "kind": ev["kind"], "reason": ev["reason"]})
+
+    verdict = None
+    blocker = None
+    if blockers:
+        blockers.sort(key=lambda pb: pb[0])
+        blocker = blockers[-1][1]
+        verdict = UNKNOWN
+    elif decider is not None:
+        verdict = "EFFECTIVE"
+    else:
+        verdict = "NOT-SET"
+
+    decider_assignment = decider[1] if decider else None
+    decider_scope = decider[0] if decider else None
+    value_obj = None
+    if decider is not None:
+        value_obj = scope_fold[decider_scope][0]
+        if len([a for s, a in candidates if s is decider_scope]) > 1:
+            findings_sink.append(Finding(
+                "LT08",
+                "decider scope value for %s is the merge of %d "
+                "assignments in that scope (last at %s:%d)"
+                % (key,
+                   len([a for s, a in candidates
+                        if s is decider_scope]),
+                   decider_assignment.file, decider_assignment.line),
+                decider_assignment.file, decider_assignment.line))
+
+    return {
+        "verdict": verdict,
+        "key": key,
+        "decider_assignment": decider_assignment,
+        "decider_scope": decider_scope,
+        "value_obj": value_obj,
+        "value": value_obj.render() if value_obj is not None else None,
+        "blocker": blocker,
+        "candidates": [
+            {"scope": s, "assignment": a, "verdict": verdicts[s]}
+            for s, a in candidates
+        ],
+        "unknown_scope_count": len(unknown_after),
+    }
+
+
+def run_query(model, key, req):
+    """Full query: selection + LT25 gate + banners + coverage."""
+    findings = list(model.findings)
+    sel = select(model, key, req, findings_sink=findings)
+
+    modules, modules_src, modules_approx = effective_modules(model, req)
+    runtime_present = [m for m in modules if m in RUNTIME_VHOST_MODULES]
+    extforward = "mod_extforward" in modules
+
+    if key == "server.document-root" and runtime_present:
+        sel["verdict"] = UNKNOWN
+        src = modules_src
+        sel["blocker"] = {
+            "file": src.file if src else None,
+            "line": src.line if src else None,
+            "kind": "runtime-vhost",
+            "reason": "server.modules includes %s: document-root is "
+                      "decided at runtime, not by this assignment "
+                      "(LT25)%s"
+                      % (", ".join(runtime_present),
+                         " (modules source is approximate: "
+                         "root-scope only)" if modules_approx else ""),
+        }
+        findings.append(Finding(
+            "LT25",
+            "server.modules includes %s; server.document-root is "
+            "runtime-decided (LT25)"
+            % ", ".join(runtime_present),
+            src.file if src else None, src.line if src else None))
+    elif runtime_present:
+        findings.append(Finding(
+            "LT25",
+            "server.modules includes %s; document-root is "
+            "runtime-decided, but this key is unaffected (LT25)"
+            % ", ".join(runtime_present),
+            modules_src.file if modules_src else None,
+            modules_src.line if modules_src else None))
+
+    if extforward:
+        chain_scopes = [c["scope"] for c in sel["candidates"]
+                        if c["verdict"] in (TRUE, UNKNOWN)]
+        remoteip_tested = False
+        for s in chain_scopes:
+            node = s
+            while node is not None and node.kind != "root":
+                if node.test is not None \
+                        and node.test.field == "remoteip":
+                    remoteip_tested = True
+                node = node.parent
+        if remoteip_tested:
+            findings.append(Finding(
+                "LT17",
+                "mod_extforward is loaded and the decider chain "
+                "tests $HTTP[\"remoteip\"]: the peer address may be "
+                "rewritten before condition evaluation "
+                "([peer-ip-may-be-rewritten])"))
+
+    if sel["value"] is not None and re.search(
+            r"%[0-9]|\$[0-9]|\$\{url\.", sel["value"]):
+        findings.append(Finding(
+            "LT24",
+            "selected value %s contains per-request substitution "
+            "tokens (%%0-%%9 / $0-$9 / ${url.*}); rendered as written, "
+            "never evaluated ([capture-substitution-not-evaluated])"
+            % sel["value"]))
+
+    if req.url is not None and ("//" in req.url or "/./" in req.url
+                                or "/../" in req.url
+                                or "%" in req.url):
+        findings.append(Finding(
+            "LT18",
+            "the daemon normalizes the URL before $HTTP[\"url\"] "
+            "matching (dot-segment / encoding cleanup); this tool "
+            "evaluates --url as given "
+            "([url-normalization-not-modeled])"))
+    if req.header_dup:
+        findings.append(Finding(
+            "LT18",
+            "duplicate --header values were supplied for one name; "
+            "last wins in this query model"))
+
+    if sel["blocker"] is not None and sel["verdict"] == UNKNOWN:
+        findings.append(Finding(
+            "LT21" if sel["blocker"]["kind"] == "unknown-scope"
+            else "LT05",
+            "verdict UNKNOWN: %s at %s:%d"
+            % (sel["blocker"]["reason"],
+               sel["blocker"]["file"], sel["blocker"]["line"]),
+            sel["blocker"]["file"], sel["blocker"]["line"]))
+
+    coverage = build_coverage(model, sel)
+    return {
+        "verdict": sel["verdict"],
+        "key": key,
+        "decider_assignment": sel["decider_assignment"],
+        "decider_scope": sel["decider_scope"],
+        "value": sel["value"],
+        "blocker": sel["blocker"],
+        "candidates": sel["candidates"],
+        "findings": findings,
+        "coverage": coverage,
+        "possibly_missing_globs": model.empty_globs,
+    }
+
+
+def build_coverage(model, sel):
+    scopes = []
+
+    def walk(scope):
+        for child in scope.children:
+            scopes.append(child)
+            walk(child)
+
+    walk(model.root)
+    keys = {}
+    total = 0
+
+    def walk_assignments(scope):
+        nonlocal total
+        for a in scope.assignments:
+            keys.setdefault(a.key, []).append(a)
+            total += 1
+        for child in scope.children:
+            walk_assignments(child)
+
+    walk_assignments(model.root)
+    return {
+        "files_read": model.files_read,
+        "includes": model.includes,
+        "include_shells": [
+            {"file": s["file"], "line": s["line"],
+             "command": s["command"]}
+            for s in model.include_shells
+        ],
+        "scopes": {
+            "condition": sum(1 for s in scopes
+                             if s.kind == "condition"),
+            "branch": sum(1 for s in scopes if s.kind == "branch"),
+            "global_blocks": model.global_blocks,
+            "headers": [{"file": s.header_file, "line": s.header_line,
+                         "header": s.header_text()} for s in scopes],
+        },
+        "keys_assigned": len(keys),
+        "assignments": total,
+        "unparseable_lines": len(model.unparseable),
+        "unparseable": [
+            {"file": u["file"], "line": u["line"], "text": u["text"],
+             "assignment_shaped": u["assignment_shaped"],
+             "scope": scope_chain_text(u["scope"])}
+            for u in model.unparseable
+        ],
+        "empty_globs": model.empty_globs,
+        "dependencies": {
+            "env": sorted(model.dependencies["env"]),
+            "var_pid": model.dependencies["pid"],
+            "var_cwd": model.dependencies["cwd"],
+        },
+        "unknown_scope_assignments_for_key": sel["unknown_scope_count"],
+        "regex_unknown": model.regex_unknown,
+        "env_unknown_refs": model.env_unknown_refs,
+    }
+
+# ---------------------------------------------------------------- output
+
+def scope_chain_text(scope):
+    if scope is None or scope.kind == "root":
+        return "root"
+    return " under ".join(scope.chain_desc())
+
+
+def scope_chain_json(scope):
+    if scope is None or scope.kind == "root":
+        return [{"scope": "root"}]
+    out = []
+    for seg in scope.chain_desc():
+        out.append({"header": seg})
+    return out
+
+
+def result_to_json(result):
+    decider = result["decider_assignment"]
+    data = {
+        "tool": "lighttpdwho",
+        "version": VERSION,
+        "verdict": result["verdict"],
+        "key": result["key"],
+        "decider": None,
+        "value": result["value"],
+        "blocker": result["blocker"],
+        "candidates": [],
+        "possibly_missing_globs": [
+            {"file": g["file"], "line": g["line"],
+             "pattern": g["pattern"]}
+            for g in result["possibly_missing_globs"]
+        ],
+        "findings": [f.to_dict() for f in result["findings"]],
+        "unmodeled": {
+            "include_shell": [
+                {"file": s["file"], "line": s["line"],
+                 "command": s["command"]}
+                for s in result["coverage"]["include_shells"]
+            ],
+            "env_unknown": result["coverage"]["env_unknown_refs"],
+            "regex_unknown": result["coverage"]["regex_unknown"],
+        },
+        "coverage": result["coverage"],
+    }
+    if decider is not None:
+        data["decider"] = {
+            "file": decider.file,
+            "line": decider.line,
+            "where": "%s:%d" % (decider.file, decider.line),
+            "scope": scope_chain_text(result["decider_scope"]),
+            "scope_chain": scope_chain_json(result["decider_scope"]),
+            "value": result["value"],
+        }
+    for cand in result["candidates"]:
+        a = cand["assignment"]
+        data["candidates"].append({
+            "file": a.file,
+            "line": a.line,
+            "where": "%s:%d" % (a.file, a.line),
+            "scope": scope_chain_text(cand["scope"]),
+            "verdict": cand["verdict"],
+            "op": a.op,
+            "value": a.value.render(),
+        })
+    return data
+
+
+def render_text(result):
+    out = [result["verdict"]]
+    decider = result["decider_assignment"]
+    if result["verdict"] == "EFFECTIVE" and decider is not None:
+        out.append("decider: %s:%d (%s) -- %s = %s"
+                   % (decider.file, decider.line,
+                      scope_chain_text(result["decider_scope"]),
+                      result["key"], result["value"]))
+        out.append("value: %s" % result["value"])
+    elif result["verdict"] == "UNKNOWN" and result["blocker"] is not None:
+        b = result["blocker"]
+        out.append("blocker: %s:%d -- %s"
+                   % (b["file"], b["line"], b["reason"]))
+    elif result["verdict"] == "NOT-SET":
+        out.append("no assignment to %s applies to this request"
+                   % result["key"])
+        for g in result["possibly_missing_globs"]:
+            out.append("[possibly-missing] include glob %r at %s:%d "
+                       "matched nothing; the key may live in a file "
+                       "that was never read"
+                       % (g["pattern"], g["file"], g["line"]))
+    if result["candidates"]:
+        out.append("candidates:")
+        for cand in result["candidates"]:
+            a = cand["assignment"]
+            out.append("  [%s] %s:%d %s: %s %s %s"
+                       % (cand["verdict"], a.file, a.line,
+                          scope_chain_text(cand["scope"]),
+                          result["key"], a.op, a.value.render()))
+    out.append("findings:")
+    if result["findings"]:
+        for f in result["findings"]:
+            out.append("  " + f.render())
+    else:
+        out.append("  none")
+    cov = result["coverage"]
+    out.append("unmodeled:")
+    shells = cov["include_shells"]
+    out.append("  include_shell (%d):" % len(shells))
+    if shells:
+        for s in shells:
+            out.append("    %s:%d: include_shell %r"
+                       % (s["file"], s["line"], s["command"]))
+    else:
+        out.append("    none")
+    out.append("  env-unknown (%d): %s"
+               % (len(cov["env_unknown_refs"]),
+                  ", ".join("%s (at %s:%d)" % (e["name"], e["file"],
+                                               e["line"])
+                            for e in cov["env_unknown_refs"])
+                  or "none"))
+    out.append("  regex-unknown (%d): %s"
+               % (len(cov["regex_unknown"]),
+                  ", ".join("%r (at %s:%d)" % (r["pattern"], r["file"],
+                                               r["line"])
+                            for r in cov["regex_unknown"])
+                  or "none"))
+    out.append("coverage:")
+    out.append("  files read (%d):" % len(cov["files_read"]))
+    for f in cov["files_read"]:
+        out.append("    %s (%d bytes, %d lines)"
+                   % (f["path"], f["bytes"], f["lines"]))
+    out.append("  includes (%d):" % len(cov["includes"]))
+    for inc in cov["includes"]:
+        out.append("    %s:%d include %r -> %s (%s)"
+                   % (inc["file"], inc["line"], inc["pattern"],
+                      inc["resolved"], inc["kind"]))
+    sc = cov["scopes"]
+    out.append("  scopes: %d condition, %d else-branch, %d global block"
+               % (sc["condition"], sc["branch"], sc["global_blocks"]))
+    out.append("  keys assigned: %d (%d assignments)"
+               % (cov["keys_assigned"], cov["assignments"]))
+    out.append("  gated/UNKNOWN-scope assignments for %s: %d"
+               % (result["key"],
+                  cov["unknown_scope_assignments_for_key"]))
+    deps = cov["dependencies"]
+    out.append("  dependencies: env=[%s] var.PID=%s var.CWD=%s"
+               % (", ".join(deps["env"]),
+                  "yes" if deps["var_pid"] else "no",
+                  "yes" if deps["var_cwd"] else "no"))
+    out.append("  unparseable lines: %d" % cov["unparseable_lines"])
+    return "\n".join(out) + "\n"
+
+
+def iter_condition_scopes(model):
+    out = []
+
+    def walk(scope):
+        for child in scope.children:
+            if child.kind in ("condition", "branch"):
+                out.append(child)
+            walk(child)
+
+    walk(model.root)
+    return out
+
+
+def list_conditions_text(model):
+    scopes = iter_condition_scopes(model)
+    lines = ["conditions (%d):" % len(scopes)]
+    for s in scopes:
+        keys = sorted({a.key for a in s.assignments})
+        merged = ""
+        if s.merged_from:
+            merged = " [merged with identical block at %s]" % (
+                ", ".join("%s:%d" % mf for mf in s.merged_from))
+        lines.append("  %s:%d %s (%s) -- keys: %s%s"
+                     % (s.header_file, s.header_line, s.header_text(),
+                        scope_chain_text(s.parent)
+                        if s.parent is not None and s.parent.kind
+                        != "root" else "root",
+                        ", ".join(keys) if keys else "(none)",
+                        merged))
+    return "\n".join(lines) + "\n"
+
+
+def list_conditions_json(model):
+    scopes = iter_condition_scopes(model)
+    out = []
+    for s in scopes:
+        out.append({
+            "file": s.header_file,
+            "line": s.header_line,
+            "where": "%s:%d" % (s.header_file, s.header_line),
+            "header": s.header_text(),
+            "kind": s.kind,
+            "nesting": scope_chain_text(s.parent)
+            if s.parent is not None else "root",
+            "merged_from": ["%s:%d" % mf for mf in s.merged_from],
+            "keys": sorted({a.key for a in s.assignments}),
+        })
+    return {"tool": "lighttpdwho", "version": VERSION,
+            "mode": "list-conditions", "conditions": out}
+
+
+def list_keys_text(model):
+    by_key = {}
+
+    def walk(scope):
+        for a in scope.assignments:
+            by_key.setdefault(a.key, []).append((scope, a))
+        for child in scope.children:
+            walk(child)
+
+    walk(model.root)
+    lines = ["keys (%d):" % len(by_key)]
+    for key in sorted(by_key):
+        pairs = by_key[key]
+        by_scope = {}
+        for scope, a in pairs:
+            by_scope.setdefault(scope_chain_text(scope), []).append(a)
+        counts = ", ".join("%s x%d" % (s, len(v))
+                           for s, v in by_scope.items())
+        first = min(pairs, key=lambda sa: sa[1].stream_index)[1]
+        last = max(pairs, key=lambda sa: sa[1].stream_index)[1]
+        lines.append("  %s -- %d assignments (%s); first %s:%d, "
+                     "last %s:%d"
+                     % (key, len(pairs), counts,
+                        first.file, first.line, last.file, last.line))
+    return "\n".join(lines) + "\n"
+
+
+def list_keys_json(model):
+    by_key = {}
+
+    def walk(scope):
+        for a in scope.assignments:
+            by_key.setdefault(a.key, []).append((scope, a))
+        for child in scope.children:
+            walk(child)
+
+    walk(model.root)
+    out = []
+    for key in sorted(by_key):
+        pairs = by_key[key]
+        by_scope = {}
+        for scope, a in pairs:
+            by_scope.setdefault(scope_chain_text(scope), []).append(a)
+        first = min(pairs, key=lambda sa: sa[1].stream_index)[1]
+        last = max(pairs, key=lambda sa: sa[1].stream_index)[1]
+        out.append({
+            "key": key,
+            "assignments": len(pairs),
+            "by_scope": {s: len(v) for s, v in by_scope.items()},
+            "first": "%s:%d" % (first.file, first.line),
+            "last": "%s:%d" % (last.file, last.line),
+        })
+    return {"tool": "lighttpdwho", "version": VERSION,
+            "mode": "list-keys", "keys": out}
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="lighttpdwho",
+        description="Which lighttpd condition block sets KEY for this "
+                    "request, and at which file:line?")
+    ap.add_argument("key", nargs="?",
+                    help="top-level option name, e.g. "
+                         "server.document-root")
+    ap.add_argument("--host", default=None,
+                    help="request Host authority, as given")
+    ap.add_argument("--url", default=None,
+                    help="request URL path (no host, no query string)")
+    ap.add_argument("--scheme", default=None,
+                    help="http or https")
+    ap.add_argument("--method", default=None,
+                    help="request method token")
+    ap.add_argument("--querystring", default=None,
+                    help="part after ?, empty string when there is no ?")
+    ap.add_argument("--remoteip", default=None,
+                    help="peer address as the daemon sees it")
+    ap.add_argument("--socket", default=None,
+                    help="listening socket, ip:port or a unix path")
+    ap.add_argument("--header", action="append", default=[],
+                    metavar="'Name: value'",
+                    help="request header; repeatable, last wins")
+    ap.add_argument("--env", action="append", default=[],
+                    metavar="K=V",
+                    help="daemon startup environment value; "
+                         "repeatable (the only env. source)")
+    ap.add_argument("--cwd", default=None,
+                    help="directory the daemon was started in "
+                         "(for var.CWD)")
+    ap.add_argument("--conf", action="append", default=[],
+                    metavar="FILE",
+                    help="config file; repeatable, concatenated in "
+                         "order (default: /etc/lighttpd/lighttpd.conf)")
+    ap.add_argument("--list-conditions", action="store_true",
+                    help="list every conditional block")
+    ap.add_argument("--list-keys", action="store_true",
+                    help="list every assigned key")
+    ap.add_argument("--json", action="store_true", dest="as_json",
+                    help="machine-readable output")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print the verdict line only")
+    ap.add_argument("--version", action="store_true",
+                    help="print the version and exit")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if args.version:
+        print("lighttpdwho %s" % VERSION)
+        return 0
+    if args.list_conditions and args.list_keys:
+        ap.error("--list-conditions and --list-keys are exclusive")
+    if (args.list_conditions or args.list_keys) and args.key:
+        ap.error("KEY cannot be combined with an inventory mode")
+    if not args.key and not args.list_conditions \
+            and not args.list_keys:
+        ap.error("KEY is required (or --list-conditions / --list-keys)")
+    if args.key and not KEY_RE.match(args.key):
+        ap.error("KEY must be of modulename.key shape, e.g. "
+                 "server.document-root")
+    if args.remoteip is not None:
+        try:
+            ipaddress.ip_address(args.remoteip)
+        except ValueError:
+            ap.error("bad --remoteip %r: not an IP address"
+                     % args.remoteip)
+    for h in args.header:
+        name, sep, _val = h.partition(":")
+        if not sep or not name.strip():
+            ap.error("bad --header %r: expected 'Name: value'" % h)
+    env = {}
+    for e in args.env:
+        if "=" not in e:
+            ap.error("bad --env %r: expected K=V" % e)
+        k, v = e.split("=", 1)
+        if not k:
+            ap.error("bad --env %r: expected K=V" % e)
+        env[k] = v
+    roots = list(args.conf)
+    if not roots:
+        if os.path.isfile(DEFAULT_CONF):
+            roots = [DEFAULT_CONF]
+        else:
+            print("lighttpdwho: no --conf given and %s does not exist"
+                  % DEFAULT_CONF, file=sys.stderr)
+            return 2
+    for r in roots:
+        if not os.path.isfile(r):
+            print("lighttpdwho: config file not found: %s" % r,
+                  file=sys.stderr)
+            return 2
+    try:
+        parser = Parser(roots, env, args.cwd)
+        model = parser.parse()
+    except FatalConfig as exc:
+        print("lighttpdwho: %s" % exc, file=sys.stderr)
+        return 2
+    assign_precedence(model)
+
+    if args.list_conditions:
+        scopes = iter_condition_scopes(model)
+        if args.as_json:
+            print(json.dumps(list_conditions_json(model), indent=2))
+        else:
+            print(list_conditions_text(model), end="")
+        return 0 if scopes else 1
+    if args.list_keys:
+        data = list_keys_json(model)
+        if args.as_json:
+            print(json.dumps(data, indent=2))
+        else:
+            print(list_keys_text(model), end="")
+        return 0 if data["keys"] else 1
+
+    req = Request(args)
+    try:
+        result = run_query(model, args.key, req)
+    except Exception as exc:  # never leak a traceback as an answer
+        print("lighttpdwho: internal error: %s" % exc, file=sys.stderr)
+        return 2
+    if args.quiet and not args.as_json:
+        print(result["verdict"])
+    elif args.as_json:
+        print(json.dumps(result_to_json(result), indent=2))
+    else:
+        print(render_text(result), end="")
+    return 0 if result["verdict"] == "EFFECTIVE" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
